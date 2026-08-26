@@ -5,11 +5,15 @@ A super simple FastAPI application that allows students to view and sign up
 for extracurricular activities at Mergington High School.
 """
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Cookie, Depends, FastAPI, HTTPException, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import RedirectResponse
+from pydantic import BaseModel
+import hmac
+import json
 import os
 from pathlib import Path
+import secrets
 
 app = FastAPI(title="Mergington High School API",
               description="API for viewing and signing up for extracurricular activities")
@@ -18,6 +22,28 @@ app = FastAPI(title="Mergington High School API",
 current_dir = Path(__file__).parent
 app.mount("/static", StaticFiles(directory=os.path.join(Path(__file__).parent,
           "static")), name="static")
+
+AUTH_COOKIE_NAME = "teacher_session"
+SESSION_MAX_AGE = 8 * 60 * 60
+teacher_sessions: dict[str, str] = {}
+
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+def load_teachers() -> dict[str, str]:
+    with (current_dir / "teachers.json").open(encoding="utf-8") as file:
+        return json.load(file)
+
+
+def require_teacher(
+    session_token: str | None = Cookie(default=None, alias=AUTH_COOKIE_NAME)
+) -> str:
+    if session_token is None or session_token not in teacher_sessions:
+        raise HTTPException(status_code=401, detail="Teacher login required")
+    return teacher_sessions[session_token]
 
 # In-memory activity database
 activities = {
@@ -88,7 +114,51 @@ def get_activities():
     return activities
 
 
-@app.post("/activities/{activity_name}/signup")
+@app.get("/auth/status")
+def get_auth_status(
+    session_token: str | None = Cookie(default=None, alias=AUTH_COOKIE_NAME)
+):
+    username = teacher_sessions.get(session_token) if session_token else None
+    return {"authenticated": username is not None, "username": username}
+
+
+@app.post("/auth/login")
+def login(credentials: LoginRequest, response: Response):
+    teachers = load_teachers()
+    expected_password = teachers.get(credentials.username)
+
+    if expected_password is None or not hmac.compare_digest(
+        credentials.password, expected_password
+    ):
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+
+    session_token = secrets.token_urlsafe(32)
+    teacher_sessions[session_token] = credentials.username
+    response.set_cookie(
+        key=AUTH_COOKIE_NAME,
+        value=session_token,
+        httponly=True,
+        max_age=SESSION_MAX_AGE,
+        samesite="strict",
+    )
+    return {"message": "Logged in", "username": credentials.username}
+
+
+@app.post("/auth/logout")
+def logout(
+    response: Response,
+    session_token: str | None = Cookie(default=None, alias=AUTH_COOKIE_NAME),
+):
+    if session_token:
+        teacher_sessions.pop(session_token, None)
+    response.delete_cookie(AUTH_COOKIE_NAME)
+    return {"message": "Logged out"}
+
+
+@app.post(
+    "/activities/{activity_name}/signup",
+    dependencies=[Depends(require_teacher)],
+)
 def signup_for_activity(activity_name: str, email: str):
     """Sign up a student for an activity"""
     # Validate activity exists
@@ -110,7 +180,10 @@ def signup_for_activity(activity_name: str, email: str):
     return {"message": f"Signed up {email} for {activity_name}"}
 
 
-@app.delete("/activities/{activity_name}/unregister")
+@app.delete(
+    "/activities/{activity_name}/unregister",
+    dependencies=[Depends(require_teacher)],
+)
 def unregister_from_activity(activity_name: str, email: str):
     """Unregister a student from an activity"""
     # Validate activity exists
